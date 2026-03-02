@@ -208,6 +208,7 @@ __marimo__/
 
 # Large data files
 data/
+results/
 
 tmpclaude-*
 results/HW1/Q1/data/TAQ_september2025_top1000.csv
