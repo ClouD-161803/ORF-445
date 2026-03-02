@@ -1,7 +1,22 @@
 import pandas as pd
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import polars as pl
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.figure import Figure
+from zoneinfo import ZoneInfo
+
+
+EXCHANGE_NAMES = {
+    'A': 'NYSE American', 'B': 'NASDAQ BX', 'C': 'NSX',
+    'D': 'FINRA ADF', 'H': 'MIAX', 'J': 'Cboe EDGA',
+    'K': 'Cboe EDGX', 'M': 'CHX', 'N': 'NYSE',
+    'P': 'NYSE Arca', 'Q': 'NASDAQ', 'U': 'MEMX',
+    'V': 'IEX', 'X': 'NASDAQ PSX', 'Y': 'Cboe BYX',
+    'Z': 'Cboe BZX',
+}
 
 
 # Old implementation
@@ -192,3 +207,457 @@ class TAQDataProcessorPolars:
         return df
 
 
+class NBBO:
+    """
+    National Best Bid and Offer computation and visualization.
+
+    Computes the NBBO from multi-exchange TAQ quote data:
+      NBBO Bid = max(prevailing bid across all valid exchanges)
+      NBBO Ask = min(prevailing ask across all valid exchanges)
+
+    The prevailing quote from each exchange at time t is defined as the
+    most recent quote published by that exchange at or before t (last
+    observation carried forward). This is implemented efficiently via
+    pandas merge_asof with direction='backward', fully exploiting
+    nanosecond-precision timestamps.
+    """
+
+    def __init__(
+        self,
+        quotes: pd.DataFrame,
+        trades: pd.DataFrame | None = None,
+        exclude_exchanges: list[str] | None = None,
+        min_records: int = 100,
+    ):
+        self.exclude_exchanges = exclude_exchanges or []
+        self.min_records = min_records
+
+        # Determine valid exchanges
+        counts = quotes['EX'].value_counts()
+        valid = counts[counts >= min_records].index.tolist()
+        self.valid_exchanges = sorted(
+            ex for ex in valid if ex not in self.exclude_exchanges
+        )
+
+        # Store filtered, sorted quotes
+        self.quotes = (
+            quotes[quotes['EX'].isin(self.valid_exchanges)]
+            .sort_values(by='TIMESTAMP')
+            .reset_index(drop=True)
+        )
+        self.trades = (
+            trades.sort_values(by='TIMESTAMP').reset_index(drop=True)
+            if trades is not None else None
+        )
+
+        # Cached results
+        self._nbbo_series: pd.DataFrame | None = None
+        self._trades_with_nbbo: pd.DataFrame | None = None
+
+    # ------------------------------------------------------------------
+    # Core computation
+    # ------------------------------------------------------------------
+
+    def compute(
+        self,
+        start: pd.Timestamp | None = None,
+        end: pd.Timestamp | None = None,
+    ) -> pd.DataFrame:
+        """
+        Compute the NBBO time series over a window.
+
+        For every unique quote timestamp in [start, end], determines the
+        prevailing quote from each exchange (merge_asof backward) and
+        returns NBBO_BID (max), NBBO_ASK (min), NBBO_MID, NBBO_SPREAD.
+        """
+        quotes = self.quotes
+        if start is not None:
+            quotes = quotes[quotes['TIMESTAMP'] >= start]
+        if end is not None:
+            quotes = quotes[quotes['TIMESTAMP'] <= end]
+
+        if quotes.empty:
+            self._nbbo_series = pd.DataFrame(
+                columns=['TIMESTAMP', 'NBBO_BID', 'NBBO_ASK',
+                         'NBBO_MID', 'NBBO_SPREAD']
+            )
+            return self._nbbo_series
+
+        # Unified timestamp grid
+        all_times = (
+            quotes['TIMESTAMP']
+            .drop_duplicates()
+            .sort_values()
+            .reset_index(drop=True)
+        )
+        result = pd.DataFrame({'TIMESTAMP': all_times})
+
+        bid_cols, ask_cols = [], []
+
+        for ex in self.valid_exchanges:
+            ex_q = (
+                quotes[quotes['EX'] == ex][['TIMESTAMP', 'BID', 'ASK']]
+                .sort_values(by='TIMESTAMP')
+                .reset_index(drop=True)
+            )
+            if ex_q.empty:
+                continue
+
+            merged = pd.merge_asof(
+                result[['TIMESTAMP']], ex_q,
+                on='TIMESTAMP', direction='backward',
+            )
+            result[f'BID_{ex}'] = merged['BID']
+            result[f'ASK_{ex}'] = merged['ASK']
+            bid_cols.append(f'BID_{ex}')
+            ask_cols.append(f'ASK_{ex}')
+
+        result['NBBO_BID'] = result[bid_cols].max(axis=1)
+        result['NBBO_ASK'] = result[ask_cols].min(axis=1)
+        result['NBBO_MID'] = (result['NBBO_BID'] + result['NBBO_ASK']) / 2
+        result['NBBO_SPREAD'] = result['NBBO_ASK'] - result['NBBO_BID']
+
+        clean = result[
+            ['TIMESTAMP', 'NBBO_BID', 'NBBO_ASK', 'NBBO_MID', 'NBBO_SPREAD']
+        ].copy()
+        self._nbbo_series = clean
+        return clean
+
+    def compute_at_trades(self) -> pd.DataFrame:
+        """
+        Compute NBBO at each trade timestamp via merge_asof.
+
+        For each exchange, finds the most recent quote at or before each
+        trade time, then takes NBBO_BID = max(bids), NBBO_ASK = min(asks).
+        Also records which exchange provided the best bid/ask.
+        """
+        if self.trades is None:
+            raise ValueError("No trades data provided.")
+
+        trades = self.trades.copy()
+
+        bids, asks = {}, {}
+        for ex in self.valid_exchanges:
+            ex_q = (
+                self.quotes[self.quotes['EX'] == ex][['TIMESTAMP', 'BID', 'ASK']]
+                .sort_values(by='TIMESTAMP')
+                .reset_index(drop=True)
+            )
+            if ex_q.empty:
+                continue
+
+            merged = pd.merge_asof(
+                trades[['TIMESTAMP']], ex_q,
+                on='TIMESTAMP', direction='backward',
+            )
+            bids[ex] = merged['BID'].values
+            asks[ex] = merged['ASK'].values
+
+        bids_df = pd.DataFrame(bids, index=trades.index)
+        asks_df = pd.DataFrame(asks, index=trades.index)
+
+        trades['NBBO_BID'] = bids_df.max(axis=1, skipna=True)
+        trades['NBBO_ASK'] = asks_df.min(axis=1, skipna=True)
+
+        # idxmax / idxmin raise on all-NaN rows; guard with a mask
+        has_bid = bids_df.notna().any(axis=1)
+        has_ask = asks_df.notna().any(axis=1)
+        trades['NBBO_BID_EX'] = pd.Series('', index=trades.index, dtype='object')
+        trades['NBBO_ASK_EX'] = pd.Series('', index=trades.index, dtype='object')
+        if has_bid.any():
+            trades.loc[has_bid, 'NBBO_BID_EX'] = (
+                bids_df.loc[has_bid].idxmax(axis=1).values
+            )
+        if has_ask.any():
+            trades.loc[has_ask, 'NBBO_ASK_EX'] = (
+                asks_df.loc[has_ask].idxmin(axis=1).values
+            )
+        trades['NBBO_MID'] = (trades['NBBO_BID'] + trades['NBBO_ASK']) / 2
+        trades['NBBO_SPREAD'] = trades['NBBO_ASK'] - trades['NBBO_BID']
+
+        self._trades_with_nbbo = trades
+        return trades
+
+    # ------------------------------------------------------------------
+    # Trade classification
+    # ------------------------------------------------------------------
+
+    def classify_trades(self, tolerance: float = 1e-6) -> pd.DataFrame:
+        """
+        Classify each trade relative to the NBBO.
+
+        Categories: below_bid, at_bid, between, at_ask, above_ask.
+        """
+        if self._trades_with_nbbo is None:
+            self.compute_at_trades()
+
+        df = self._trades_with_nbbo
+        assert df is not None
+
+        conditions = [
+            df['PRICE'] < df['NBBO_BID'] - tolerance,
+            (df['PRICE'] >= df['NBBO_BID'] - tolerance)
+            & (df['PRICE'] <= df['NBBO_BID'] + tolerance),
+            (df['PRICE'] > df['NBBO_BID'] + tolerance)
+            & (df['PRICE'] < df['NBBO_ASK'] - tolerance),
+            (df['PRICE'] >= df['NBBO_ASK'] - tolerance)
+            & (df['PRICE'] <= df['NBBO_ASK'] + tolerance),
+            df['PRICE'] > df['NBBO_ASK'] + tolerance,
+        ]
+        choices = ['below_bid', 'at_bid', 'between', 'at_ask', 'above_ask']
+        df['TRADE_CLASS'] = np.select(conditions, choices, default='unknown')
+
+        self._trades_with_nbbo = df
+        return df
+
+    def summary(self) -> pd.DataFrame:
+        """Print and return a summary of trade classification statistics."""
+        if (self._trades_with_nbbo is None
+                or 'TRADE_CLASS' not in self._trades_with_nbbo.columns):
+            self.classify_trades()
+
+        df = self._trades_with_nbbo
+        assert df is not None
+        total = len(df)
+
+        order = ['below_bid', 'at_bid', 'between', 'at_ask', 'above_ask']
+        labels = [
+            'Below Bid', 'At Bid', 'Between Bid-Ask',
+            'At Ask', 'Above Ask',
+        ]
+
+        rows = []
+        for cat, label in zip(order, labels):
+            count = int((df['TRADE_CLASS'] == cat).sum())
+            rows.append({
+                'Category': label,
+                'Count': count,
+                'Fraction': count / total if total else 0,
+            })
+
+        summary_df = pd.DataFrame(rows)
+
+        print(f"\nTrade Classification Summary (n={total:,})")
+        print(f"{'Category':<20} {'Count':>8} {'Fraction':>10}")
+        print('-' * 40)
+        for _, row in summary_df.iterrows():
+            print(
+                f"{row['Category']:<20} "
+                f"{row['Count']:>8,} "
+                f"{row['Fraction']:>10.2%}"
+            )
+
+        inside = int(summary_df.loc[
+            summary_df['Category'].isin(
+                ['At Bid', 'Between Bid-Ask', 'At Ask']
+            ), 'Count'
+        ].sum())
+        outside = int(summary_df.loc[
+            summary_df['Category'].isin(
+                ['Below Bid', 'Above Ask']
+            ), 'Count'
+        ].sum())
+        print(f"\n{'Inside NBBO':<20} {inside:>8,} {inside / total:>10.2%}")
+        print(f"{'Outside NBBO':<20} {outside:>8,} {outside / total:>10.2%}")
+
+        inverted = int((df['NBBO_SPREAD'] < 0).sum())
+        print(f"\nInverted spreads: {inverted:,} ({inverted / total:.2%})")
+        print(f"Mean NBBO spread:   ${df['NBBO_SPREAD'].mean():.4f}")
+        print(f"Median NBBO spread: ${df['NBBO_SPREAD'].median():.4f}")
+
+        return summary_df
+
+    # ------------------------------------------------------------------
+    # Plotting
+    # ------------------------------------------------------------------
+
+    def plot(
+        self,
+        start: pd.Timestamp | None = None,
+        end: pd.Timestamp | None = None,
+        title: str = 'NBBO Analysis',
+        figsize: tuple[float, float] = (18, 10),
+        save_path: str | None = None,
+        quote_alpha: float = 0.35,
+        quote_linewidth: float = 0.6,
+        trade_size: float = 20,
+        nbbo_alpha: float = 0.25,
+        show_legend: bool = True,
+        max_points_per_series: int = 5000,
+        tz_display: str = 'America/New_York',
+    ) -> Figure:
+        """
+        Elaborate NBBO plot with:
+          - Per-exchange quotes as coloured step lines
+          - Trades as scatter dots (green = inside NBBO, red = outside)
+          - NBBO region shaded grey with solid boundary lines
+          - NBBO spread subplot below the main price chart
+        """
+        # Compute NBBO for window
+        nbbo = self.compute(start=start, end=end)
+        if nbbo.empty:
+            raise ValueError("No data in the specified time window.")
+
+        # Filter quotes to window
+        quotes_w = self.quotes
+        if start is not None:
+            quotes_w = quotes_w[quotes_w['TIMESTAMP'] >= start]
+        if end is not None:
+            quotes_w = quotes_w[quotes_w['TIMESTAMP'] <= end]
+
+        # Filter trades to window
+        trades_w = None
+        source = self._trades_with_nbbo if self._trades_with_nbbo is not None else self.trades
+        if source is not None:
+            trades_w = source.copy()
+            if start is not None:
+                trades_w = trades_w[trades_w['TIMESTAMP'] >= start]
+            if end is not None:
+                trades_w = trades_w[trades_w['TIMESTAMP'] <= end]
+
+        # Downsample NBBO for plotting
+        def _downsample(frame: pd.DataFrame, max_pts: int) -> pd.DataFrame:
+            if len(frame) > max_pts:
+                step = max(1, len(frame) // max_pts)
+                return frame.iloc[::step]
+            return frame
+
+        nbbo_p = _downsample(nbbo, max_points_per_series)
+
+        # ---- Figure setup ----
+        fig, (ax, ax_s) = plt.subplots(
+            2, 1, figsize=figsize,
+            gridspec_kw={'height_ratios': [3, 1]},
+            sharex=True,
+        )
+        fig.patch.set_facecolor('white')
+
+        for a in (ax, ax_s):
+            a.set_facecolor('#fafafa')
+            a.grid(True, alpha=0.25, linestyle='--', color='grey')
+            a.spines['top'].set_visible(False)
+            a.spines['right'].set_visible(False)
+
+        # ---- Exchange colours ----
+        cmap = plt.colormaps['tab20']
+        ex_colors = {
+            ex: cmap(i) for i, ex in enumerate(self.valid_exchanges)
+        }
+
+        # ---- Exchange quote step lines ----
+        for ex in self.valid_exchanges:
+            ex_data = (
+                quotes_w[quotes_w['EX'] == ex].sort_values(by='TIMESTAMP')
+            )
+            if ex_data.empty:
+                continue
+            ex_data = _downsample(ex_data, max_points_per_series)
+
+            color = ex_colors[ex]
+            name = EXCHANGE_NAMES.get(ex, ex)
+
+            ax.step(
+                ex_data['TIMESTAMP'], ex_data['BID'],
+                color=color, alpha=quote_alpha,
+                linewidth=quote_linewidth,
+                where='post', label=name,
+            )
+            ax.step(
+                ex_data['TIMESTAMP'], ex_data['ASK'],
+                color=color, alpha=quote_alpha,
+                linewidth=quote_linewidth,
+                where='post',
+            )
+
+        # ---- NBBO shading ----
+        ax.fill_between(
+            nbbo_p['TIMESTAMP'],
+            nbbo_p['NBBO_BID'],
+            nbbo_p['NBBO_ASK'],
+            alpha=nbbo_alpha, color='silver',
+            label='NBBO Region', step='post',
+            zorder=2, edgecolor='none',
+        )
+
+        # ---- NBBO boundary lines ----
+        ax.step(
+            nbbo_p['TIMESTAMP'], nbbo_p['NBBO_BID'],
+            color='black', linewidth=1.3, alpha=0.85,
+            where='post', label='NBBO Bid', zorder=3,
+        )
+        ax.step(
+            nbbo_p['TIMESTAMP'], nbbo_p['NBBO_ASK'],
+            color='black', linewidth=1.3, alpha=0.85,
+            where='post', label='NBBO Ask',
+            linestyle='--', zorder=3,
+        )
+
+        # ---- Trades ----
+        if trades_w is not None and not trades_w.empty:
+            if 'TRADE_CLASS' in trades_w.columns:
+                inside = trades_w['TRADE_CLASS'].isin(
+                    ['at_bid', 'between', 'at_ask']
+                )
+                t_in = trades_w[inside]
+                t_out = trades_w[~inside]
+                if not t_in.empty:
+                    ax.scatter(
+                        t_in['TIMESTAMP'], t_in['PRICE'],
+                        s=trade_size, c='#2ecc71', alpha=0.75,
+                        zorder=5, label='Trades (inside NBBO)',
+                        edgecolors='black', linewidths=0.3,
+                    )
+                if not t_out.empty:
+                    ax.scatter(
+                        t_out['TIMESTAMP'], t_out['PRICE'],
+                        s=trade_size, c='#e74c3c', alpha=0.75,
+                        zorder=5, label='Trades (outside NBBO)',
+                        edgecolors='black', linewidths=0.3,
+                    )
+            else:
+                ax.scatter(
+                    trades_w['TIMESTAMP'], trades_w['PRICE'],
+                    s=trade_size, c='#e74c3c', alpha=0.75,
+                    zorder=5, label='Trades',
+                    edgecolors='black', linewidths=0.3,
+                )
+
+        # ---- Labels & legend (main) ----
+        ax.set_ylabel('Price ($)', fontsize=12, fontweight='bold')
+        ax.set_title(title, fontsize=14, fontweight='bold', pad=15)
+
+        if show_legend:
+            ax.legend(
+                loc='upper left', bbox_to_anchor=(1.01, 1),
+                fontsize=8, framealpha=0.95, edgecolor='grey',
+            )
+
+        # ---- Spread subplot ----
+        ax_s.step(
+            nbbo_p['TIMESTAMP'], nbbo_p['NBBO_SPREAD'],
+            color='steelblue', linewidth=0.8, where='post',
+        )
+        ax_s.fill_between(
+            nbbo_p['TIMESTAMP'], 0, nbbo_p['NBBO_SPREAD'],
+            alpha=0.3, color='steelblue', step='post',
+        )
+        ax_s.axhline(
+            y=0, color='red', linewidth=0.5,
+            linestyle='--', alpha=0.5,
+        )
+        ax_s.set_ylabel('Spread ($)', fontsize=11, fontweight='bold')
+        ax_s.set_xlabel('Time', fontsize=12, fontweight='bold')
+
+        # ---- X-axis date formatting ----
+        tz = ZoneInfo(tz_display) if tz_display else None
+        ax_s.xaxis.set_major_formatter(
+            mdates.DateFormatter('%H:%M', tz=tz)
+        )
+        fig.autofmt_xdate(rotation=45)
+
+        plt.tight_layout()
+
+        if save_path:
+            fig.savefig(save_path, dpi=200, bbox_inches='tight')
+
+        return fig
